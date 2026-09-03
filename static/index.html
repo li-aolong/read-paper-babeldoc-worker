@@ -51,6 +51,12 @@
     <main>
       <aside>
         <div class="card warning" id="tableNotice">正在读取 BabelDOC 表格能力状态…</div>
+        <div class="card" id="authCard" hidden>
+          <strong>Worker 认证</strong>
+          <label>Bearer token（仅保存在当前浏览器会话）</label>
+          <input id="workerToken" type="password" autocomplete="off" />
+          <div class="actions"><button type="button" id="saveToken">应用 token</button></div>
+        </div>
         <form class="card" id="uploadForm">
           <strong>上传自己的 PDF</strong>
           <label>PDF 文件</label><input id="pdfFile" type="file" accept="application/pdf,.pdf" required />
@@ -77,27 +83,49 @@
       </section>
     </main>
     <script>
-      const state = { jobs: [], selected: null, kind: "original", page: 1, pages: 1, zoom: 1, poll: null };
+      const state = { jobs: [], selected: null, kind: "original", page: 1, pages: 1, zoom: 1, poll: null, token: sessionStorage.getItem("babeldocWorkerToken") || "", previewUrl: null, previewRequest: 0 };
       const $ = (id) => document.getElementById(id);
       const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+      function authorizedOptions(options = {}) {
+        const headers = new Headers(options.headers || {});
+        if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
+        return { ...options, headers };
+      }
       async function request(url, options) {
-        const response = await fetch(url, options);
+        const response = await fetch(url, authorizedOptions(options));
         if (!response.ok) { let message = `${response.status} ${response.statusText}`; try { message = (await response.json()).detail || message; } catch {} throw new Error(message); }
         return response.json();
       }
+      async function requestBlob(url, options) {
+        const response = await fetch(url, authorizedOptions(options));
+        if (!response.ok) { let message = `${response.status} ${response.statusText}`; try { message = (await response.json()).detail || message; } catch {} throw new Error(message); }
+        return { blob: await response.blob(), response };
+      }
       async function loadInfo() {
         const info = await request("/api/info");
-        $("info").textContent = `BabelDOC 0.6.4 · ${info.model} · 仅本机`;
+        $("info").textContent = `BabelDOC ${info.engine?.version || "未知"} · ${info.model} · 仅本机`;
         $("tableNotice").textContent = info.table_notice;
         $("sample").disabled = !info.sample_available || !info.api_configured;
+        $("authCard").hidden = !info.auth_required;
+        $("workerToken").value = state.token;
       }
       function renderJobs() {
         $("jobs").innerHTML = state.jobs.map(job => `<div class="job ${state.selected === job.id ? "active" : ""}" data-id="${job.id}"><strong>${escapeHtml(job.filename)}</strong><small>${escapeHtml(job.status)} · ${escapeHtml(job.stage)} · ${Math.round(job.progress || 0)}%</small><progress max="100" value="${job.progress || 0}"></progress>${job.error ? `<div class="error">${escapeHtml(job.error)}</div>` : ""}</div>`).join("") || "<small>暂无任务</small>";
         document.querySelectorAll(".job").forEach(node => node.onclick = () => selectJob(node.dataset.id));
       }
-      function renderPage() {
+      async function renderPage() {
         if (!state.selected) return;
-        $("viewer").src = `/api/jobs/${state.selected}/preview/${state.kind}/${state.page}.png`;
+        const requestId = ++state.previewRequest;
+        try {
+          const { blob } = await requestBlob(`/api/jobs/${state.selected}/preview/${state.kind}/${state.page}.png`);
+          if (requestId !== state.previewRequest) return;
+          if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+          state.previewUrl = URL.createObjectURL(blob);
+          $("viewer").src = state.previewUrl;
+        } catch (error) {
+          $("formError").textContent = error.message;
+          return;
+        }
         $("pageLabel").textContent = `${state.page} / ${state.pages}`;
         $("prevPage").disabled = state.page <= 1;
         $("nextPage").disabled = state.page >= state.pages;
@@ -114,7 +142,7 @@
         const job = state.jobs.find(item => item.id === state.selected); if (!job?.files?.[kind]) return;
         state.kind = kind; state.page = 1; const meta = await request(`/api/jobs/${job.id}/preview/${kind}`); state.pages = meta.pages || 1; applyZoom(1);
         $("preview").hidden = false; $("empty").hidden = true; $("viewerNav").hidden = false; renderPage();
-        $("download").href = `${job.files[kind]}?download=1`;
+        $("download").href = job.files[kind];
         document.querySelectorAll("nav button[data-kind]").forEach(button => button.classList.toggle("active", button.dataset.kind === kind));
       }
       function selectJob(id) {
@@ -134,6 +162,25 @@
         try { const job = await request(url, { method: "POST", body: form }); await refresh(); selectJob(job.id); }
         catch (error) { $("formError").textContent = error.message; }
       }
+      $("saveToken").onclick = async () => {
+        state.token = $("workerToken").value.trim();
+        sessionStorage.setItem("babeldocWorkerToken", state.token);
+        try { await refresh(); $("formError").textContent = ""; }
+        catch (error) { $("formError").textContent = error.message; }
+      };
+      $("download").onclick = async event => {
+        event.preventDefault();
+        const job = state.jobs.find(item => item.id === state.selected);
+        const url = job?.files?.[state.kind];
+        if (!url) return;
+        try {
+          const { blob } = await requestBlob(`${url}?download=1`);
+          const objectUrl = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = objectUrl; anchor.download = `${job.filename}.${state.kind}.pdf`; anchor.click();
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        } catch (error) { $("formError").textContent = error.message; }
+      };
       $("uploadForm").onsubmit = event => { event.preventDefault(); const form = new FormData(); form.append("file", $("pdfFile").files[0]); form.append("pages", $("pages").value); form.append("qps", $("qps").value); form.append("skip_scanned_detection", $("skipScan").checked); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/jobs", form); };
       $("sample").onclick = () => { const form = new FormData(); form.append("pages", "1,6"); form.append("qps", $("qps").value); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/sample", form); };
       document.querySelectorAll("nav button[data-kind]").forEach(button => button.onclick = () => showFile(button.dataset.kind));
@@ -147,7 +194,7 @@
         event.preventDefault();
         applyZoom(state.zoom + (event.deltaY < 0 ? 0.25 : -0.25));
       }, { passive: false });
-      Promise.all([loadInfo(), refresh()]).catch(error => $("formError").textContent = error.message);
+      loadInfo().then(refresh).catch(error => $("formError").textContent = error.message);
       state.poll = setInterval(() => refresh().catch(() => {}), 1200);
     </script>
   </body>
