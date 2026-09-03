@@ -5,13 +5,12 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -31,6 +30,7 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="babeldoc-lab")
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="BabelDOC 本地效果实验", docs_url=None, redoc_url=None)
 
@@ -100,10 +100,16 @@ def _result_files(result: Any, job_id: str) -> dict[str, str]:
 
 
 async def _translate(job_id: str) -> None:
-    from babeldoc.format.pdf import high_level
-    from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
-    from babeldoc.translator.translator import OpenAITranslator, set_translate_rate_limiter
     from babeldoc.docvision.doclayout import DocLayoutModel
+    from babeldoc.format.pdf import high_level
+    from babeldoc.format.pdf.translation_config import (
+        TranslationConfig,
+        WatermarkOutputMode,
+    )
+    from babeldoc.translator.translator import (
+        OpenAITranslator,
+        set_translate_rate_limiter,
+    )
 
     api_key = os.getenv("BABELDOC_API_KEY", "").strip()
     base_url = os.getenv("BABELDOC_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").strip()
@@ -187,8 +193,8 @@ def _run_job(job_id: str) -> None:
     _patch_job(job_id, status="running", stage="初始化 BabelDOC", progress=0.0, error=None)
     try:
         asyncio.run(_translate(job_id))
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("BabelDOC job %s failed", job_id)
+    except Exception as exc:
+        logger.exception("BabelDOC job %s failed", job_id)
         _patch_job(job_id, status="failed", stage="失败", error=str(exc)[:2000])
 
 
@@ -267,11 +273,11 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs")
 async def create_job(
-    file: UploadFile = File(...),
-    pages: str = Form(""),
-    qps: int = Form(2),
-    skip_scanned_detection: bool = Form(True),
-    auto_extract_glossary: bool = Form(False),
+    file: Annotated[UploadFile, File()],
+    pages: Annotated[str, Form()] = "",
+    qps: Annotated[int, Form()] = 2,
+    skip_scanned_detection: Annotated[bool, Form()] = True,
+    auto_extract_glossary: Annotated[bool, Form()] = False,
 ) -> dict[str, Any]:
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, "只支持 PDF 文件")
@@ -281,9 +287,9 @@ async def create_job(
 
 @app.post("/api/sample")
 def create_sample_job(
-    pages: str = Form("1,6"),
-    qps: int = Form(2),
-    auto_extract_glossary: bool = Form(False),
+    pages: Annotated[str, Form()] = "1,6",
+    qps: Annotated[int, Form()] = 2,
+    auto_extract_glossary: Annotated[bool, Form()] = False,
 ) -> dict[str, Any]:
     sample = Path(os.getenv("BABELDOC_SAMPLE_PDF", ""))
     if not sample.is_file():
