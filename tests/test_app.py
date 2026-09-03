@@ -31,6 +31,8 @@ def test_home_page_is_available() -> None:
     response = TestClient(app.app).get("/")
     assert response.status_code == 200
     assert "BabelDOC 本地效果实验" in response.text
+    assert "译文 PDF" in response.text
+    assert "纯译文 PDF" not in response.text
 
 
 def test_pdf_preview_is_inline_and_download_is_attachment(tmp_path: Path, monkeypatch) -> None:

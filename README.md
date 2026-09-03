@@ -1,6 +1,6 @@
 # read-paper-babeldoc-lab
 
-一个只监听本机回环地址的 BabelDOC 效果验证站。它与 `read-paper` 完全独立，接收 PDF 后在后台运行固定版本的 BabelDOC，并同时提供原 PDF、纯译文 PDF、双语 PDF 的浏览与下载。
+一个只监听本机回环地址的 BabelDOC 效果验证站。它与 `read-paper` 完全独立，接收 PDF 后在后台运行固定版本的 BabelDOC，并同时提供原 PDF、译文 PDF、双语 PDF 的浏览与下载。
 
 ## 当前边界
 

@@ -65,7 +65,7 @@
       <section>
         <nav id="viewerNav" hidden>
           <button data-kind="original" class="secondary">原 PDF</button>
-          <button data-kind="mono" class="secondary">纯译文 PDF</button>
+          <button data-kind="mono" class="secondary">译文 PDF</button>
           <button data-kind="dual" class="secondary">双语 PDF</button>
           <div class="page-controls"><button id="prevPage" class="secondary" title="上一页">←</button><span id="pageLabel">1 / 1</span><button id="nextPage" class="secondary" title="下一页">→</button></div>
           <span class="spacer"></span><a id="download" class="button secondary" download>下载当前 PDF</a>
@@ -113,8 +113,12 @@
         const preferred = job.files?.mono ? "mono" : "original"; showFile(preferred);
       }
       async function refresh() {
+        const previous = state.jobs.find(item => item.id === state.selected);
         state.jobs = await request("/api/jobs"); renderJobs();
-        if (state.selected) { const job = state.jobs.find(item => item.id === state.selected); if (job?.status === "completed" && job.files?.mono && state.kind === "original") showFile("mono"); }
+        const current = state.jobs.find(item => item.id === state.selected);
+        if (previous?.status !== "completed" && current?.status === "completed" && current.files?.mono && state.kind === "original") {
+          showFile("mono");
+        }
       }
       async function submit(url, form) {
         $("formError").textContent = "";
