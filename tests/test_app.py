@@ -33,6 +33,7 @@ def test_home_page_is_available() -> None:
     assert "BabelDOC 本地效果实验" in response.text
     assert "译文 PDF" in response.text
     assert "纯译文 PDF" not in response.text
+    assert "适应宽度" in response.text
 
 
 def test_pdf_preview_is_inline_and_download_is_attachment(tmp_path: Path, monkeypatch) -> None:
