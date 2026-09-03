@@ -1,0 +1,18 @@
+[project]
+name = "read-paper-babeldoc-lab"
+version = "0.1.0"
+description = "Local-only BabelDOC PDF translation evaluation UI"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "BabelDOC @ git+https://github.com/funstory-ai/BabelDOC.git@38d3896dcde9b5a940c62cf5563cadea673a64d3",
+  "fastapi>=0.115",
+  "python-multipart>=0.0.12",
+  "uvicorn[standard]>=0.34",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

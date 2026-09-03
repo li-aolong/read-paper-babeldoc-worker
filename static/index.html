@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BabelDOC 本地效果实验</title>
+    <style>
+      :root { color: #17202a; background: #f4f6f8; font-family: Inter, "PingFang SC", system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      body { margin: 0; }
+      header { height: 58px; display: flex; align-items: center; gap: 12px; padding: 0 22px; background: #fff; border-bottom: 1px solid #e7e9ed; }
+      header h1 { margin: 0; font-size: 17px; }
+      header span { color: #7a8491; font-size: 12px; }
+      main { display: grid; grid-template-columns: 360px minmax(0, 1fr); height: calc(100vh - 58px); }
+      aside { padding: 18px; overflow: auto; background: #fff; border-right: 1px solid #e7e9ed; }
+      .card { padding: 14px; border: 1px solid #e3e6ea; border-radius: 12px; margin-bottom: 14px; background: #fff; }
+      .warning { color: #8a5a00; background: #fff8e6; border-color: #f0d793; font-size: 12px; line-height: 1.55; }
+      label { display: block; font-size: 12px; color: #606b78; margin: 10px 0 5px; }
+      input[type="file"], input[type="text"], input[type="number"] { width: 100%; border: 1px solid #d9dde3; border-radius: 8px; padding: 9px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row > * { flex: 1; }
+      .check { display: flex; align-items: center; gap: 7px; margin: 10px 0; }
+      .check input { flex: none; }
+      button, a.button { border: 0; border-radius: 8px; background: #17202a; color: white; padding: 9px 12px; cursor: pointer; text-decoration: none; font-size: 13px; }
+      button.secondary, a.secondary { color: #36414d; background: #edf0f3; }
+      button:disabled { opacity: .45; cursor: default; }
+      .actions { display: flex; gap: 8px; margin-top: 12px; }
+      .job { padding: 10px; border-radius: 9px; border: 1px solid #e5e8ec; margin-top: 8px; cursor: pointer; }
+      .job.active { border-color: #476cff; background: #f2f5ff; }
+      .job strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+      .job small { color: #7d8793; }
+      progress { width: 100%; height: 8px; margin-top: 8px; }
+      section { min-width: 0; display: flex; flex-direction: column; }
+      nav { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 8px 14px; background: white; border-bottom: 1px solid #e7e9ed; }
+      nav .spacer { flex: 1; }
+      nav button.active { background: #476cff; }
+      iframe { width: 100%; flex: 1; border: 0; background: #59616b; }
+      .empty { display: grid; place-items: center; height: 100%; color: #8a939f; text-align: center; padding: 30px; }
+      .error { color: #b42318; white-space: pre-wrap; font-size: 12px; margin-top: 8px; }
+      @media (max-width: 850px) { main { grid-template-columns: 1fr; height: auto; } aside { border-right: 0; } section { height: 72vh; } }
+    </style>
+  </head>
+  <body>
+    <header><h1>BabelDOC 本地效果实验</h1><span id="info">读取配置…</span></header>
+    <main>
+      <aside>
+        <div class="card warning" id="tableNotice">正在读取 BabelDOC 表格能力状态…</div>
+        <form class="card" id="uploadForm">
+          <strong>上传自己的 PDF</strong>
+          <label>PDF 文件</label><input id="pdfFile" type="file" accept="application/pdf,.pdf" required />
+          <label>测试页码（留空为全文，例如 1,6）</label><input id="pages" type="text" placeholder="" />
+          <div class="row"><div><label>并发 QPS</label><input id="qps" type="number" min="1" max="4" value="2" /></div></div>
+          <label class="check"><input id="skipScan" type="checkbox" checked /> 已知是文本 PDF，跳过扫描检测</label>
+          <label class="check"><input id="glossary" type="checkbox" /> 自动提取术语（更慢、额外消耗模型）</label>
+          <div class="actions"><button type="submit">开始生成</button><button type="button" class="secondary" id="sample">运行 WSDM 表格样本（第 1、6 页）</button></div>
+          <div class="error" id="formError"></div>
+        </form>
+        <div class="card"><strong>最近任务</strong><div id="jobs"></div></div>
+      </aside>
+      <section>
+        <nav id="viewerNav" hidden>
+          <button data-kind="original" class="secondary">原 PDF</button>
+          <button data-kind="mono" class="secondary">纯译文 PDF</button>
+          <button data-kind="dual" class="secondary">双语 PDF</button>
+          <span class="spacer"></span><a id="download" class="button secondary" target="_blank">下载当前 PDF</a>
+        </nav>
+        <div id="empty" class="empty"><div><b>尚未选择任务</b><br />运行内置样本，最快查看 BabelDOC 对首页和复杂表格页的处理效果。</div></div>
+        <iframe id="viewer" title="PDF 预览" hidden></iframe>
+      </section>
+    </main>
+    <script>
+      const state = { jobs: [], selected: null, kind: "original", poll: null };
+      const $ = (id) => document.getElementById(id);
+      const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+      async function request(url, options) {
+        const response = await fetch(url, options);
+        if (!response.ok) { let message = `${response.status} ${response.statusText}`; try { message = (await response.json()).detail || message; } catch {} throw new Error(message); }
+        return response.json();
+      }
+      async function loadInfo() {
+        const info = await request("/api/info");
+        $("info").textContent = `BabelDOC 0.6.4 · ${info.model} · 仅本机`;
+        $("tableNotice").textContent = info.table_notice;
+        $("sample").disabled = !info.sample_available || !info.api_configured;
+      }
+      function renderJobs() {
+        $("jobs").innerHTML = state.jobs.map(job => `<div class="job ${state.selected === job.id ? "active" : ""}" data-id="${job.id}"><strong>${escapeHtml(job.filename)}</strong><small>${escapeHtml(job.status)} · ${escapeHtml(job.stage)} · ${Math.round(job.progress || 0)}%</small><progress max="100" value="${job.progress || 0}"></progress>${job.error ? `<div class="error">${escapeHtml(job.error)}</div>` : ""}</div>`).join("") || "<small>暂无任务</small>";
+        document.querySelectorAll(".job").forEach(node => node.onclick = () => selectJob(node.dataset.id));
+      }
+      function showFile(kind) {
+        const job = state.jobs.find(item => item.id === state.selected); if (!job?.files?.[kind]) return;
+        state.kind = kind; $("viewer").src = job.files[kind]; $("viewer").hidden = false; $("empty").hidden = true; $("viewerNav").hidden = false;
+        $("download").href = job.files[kind];
+        document.querySelectorAll("nav button").forEach(button => button.classList.toggle("active", button.dataset.kind === kind));
+      }
+      function selectJob(id) {
+        state.selected = id; renderJobs(); const job = state.jobs.find(item => item.id === id); if (!job) return;
+        const preferred = job.files?.mono ? "mono" : "original"; showFile(preferred);
+      }
+      async function refresh() {
+        state.jobs = await request("/api/jobs"); renderJobs();
+        if (state.selected) { const job = state.jobs.find(item => item.id === state.selected); if (job?.status === "completed" && job.files?.mono && state.kind === "original") showFile("mono"); }
+      }
+      async function submit(url, form) {
+        $("formError").textContent = "";
+        try { const job = await request(url, { method: "POST", body: form }); await refresh(); selectJob(job.id); }
+        catch (error) { $("formError").textContent = error.message; }
+      }
+      $("uploadForm").onsubmit = event => { event.preventDefault(); const form = new FormData(); form.append("file", $("pdfFile").files[0]); form.append("pages", $("pages").value); form.append("qps", $("qps").value); form.append("skip_scanned_detection", $("skipScan").checked); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/jobs", form); };
+      $("sample").onclick = () => { const form = new FormData(); form.append("pages", "1,6"); form.append("qps", $("qps").value); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/sample", form); };
+      document.querySelectorAll("nav button").forEach(button => button.onclick = () => showFile(button.dataset.kind));
+      Promise.all([loadInfo(), refresh()]).catch(error => $("formError").textContent = error.message);
+      state.poll = setInterval(() => refresh().catch(() => {}), 1200);
+    </script>
+  </body>
+</html>
