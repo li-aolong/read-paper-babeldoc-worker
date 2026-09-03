@@ -29,6 +29,7 @@ TABLE_NOTICE = (
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="babeldoc-lab")
 _jobs_lock = threading.Lock()
+_preview_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 logger = logging.getLogger(__name__)
 
@@ -298,11 +299,21 @@ def create_sample_job(
 
 
 @app.get("/api/jobs/{job_id}/files/{kind}")
-def get_file(job_id: str, kind: str):
+def get_file(job_id: str, kind: str, download: bool = False):
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job or kind not in {"original", "mono", "dual"}:
         raise HTTPException(404, "文件不存在")
+    path = _pdf_for_kind(job_id, job, kind)
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=path.name,
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
+def _pdf_for_kind(job_id: str, job: dict[str, Any], kind: str) -> Path:
     if kind == "original":
         input_path = job.get("_input_path")
         if not input_path:
@@ -317,7 +328,40 @@ def get_file(job_id: str, kind: str):
         path = candidates[0]
     if not path.is_file() or _job_dir(job_id) not in path.resolve().parents:
         raise HTTPException(404, "文件不存在")
-    return FileResponse(path, media_type="application/pdf", filename=path.name)
+    return path
+
+
+@app.get("/api/jobs/{job_id}/preview/{kind}")
+def preview_info(job_id: str, kind: str) -> dict[str, int]:
+    import pymupdf
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or kind not in {"original", "mono", "dual"}:
+        raise HTTPException(404, "文件不存在")
+    with pymupdf.open(_pdf_for_kind(job_id, job, kind)) as document:
+        return {"pages": document.page_count}
+
+
+@app.get("/api/jobs/{job_id}/preview/{kind}/{page}.png")
+def preview_page(job_id: str, kind: str, page: int):
+    import pymupdf
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or kind not in {"original", "mono", "dual"}:
+        raise HTTPException(404, "文件不存在")
+    pdf = _pdf_for_kind(job_id, job, kind)
+    cache = _job_dir(job_id) / "preview" / f"{kind}-{page}.png"
+    with _preview_lock:
+        if not cache.is_file():
+            with pymupdf.open(pdf) as document:
+                if page < 1 or page > document.page_count:
+                    raise HTTPException(404, "页码不存在")
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                pixmap = document[page - 1].get_pixmap(matrix=pymupdf.Matrix(1.6, 1.6), alpha=False)
+                pixmap.save(cache)
+    return FileResponse(cache, media_type="image/png")
 
 
 app.mount("/", StaticFiles(directory=STATIC_ROOT, html=True), name="static")

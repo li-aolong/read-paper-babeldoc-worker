@@ -35,7 +35,11 @@
       nav { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 8px 14px; background: white; border-bottom: 1px solid #e7e9ed; }
       nav .spacer { flex: 1; }
       nav button.active { background: #476cff; }
-      iframe { width: 100%; flex: 1; border: 0; background: #59616b; }
+      .page-controls { display: flex; align-items: center; gap: 6px; }
+      .page-controls button { padding: 6px 9px; }
+      #pageLabel { min-width: 70px; text-align: center; color: #66717e; font-size: 12px; }
+      #preview { flex: 1; min-height: 0; overflow: auto; padding: 20px; text-align: center; background: #59616b; }
+      #viewer { display: block; max-width: 100%; height: auto; margin: 0 auto; background: white; box-shadow: 0 3px 16px rgba(0,0,0,.25); }
       .empty { display: grid; place-items: center; height: 100%; color: #8a939f; text-align: center; padding: 30px; }
       .error { color: #b42318; white-space: pre-wrap; font-size: 12px; margin-top: 8px; }
       @media (max-width: 850px) { main { grid-template-columns: 1fr; height: auto; } aside { border-right: 0; } section { height: 72vh; } }
@@ -63,14 +67,15 @@
           <button data-kind="original" class="secondary">原 PDF</button>
           <button data-kind="mono" class="secondary">纯译文 PDF</button>
           <button data-kind="dual" class="secondary">双语 PDF</button>
-          <span class="spacer"></span><a id="download" class="button secondary" target="_blank">下载当前 PDF</a>
+          <div class="page-controls"><button id="prevPage" class="secondary" title="上一页">←</button><span id="pageLabel">1 / 1</span><button id="nextPage" class="secondary" title="下一页">→</button></div>
+          <span class="spacer"></span><a id="download" class="button secondary" download>下载当前 PDF</a>
         </nav>
         <div id="empty" class="empty"><div><b>尚未选择任务</b><br />运行内置样本，最快查看 BabelDOC 对首页和复杂表格页的处理效果。</div></div>
-        <iframe id="viewer" title="PDF 预览" hidden></iframe>
+        <div id="preview" hidden><img id="viewer" alt="PDF 页面预览" /></div>
       </section>
     </main>
     <script>
-      const state = { jobs: [], selected: null, kind: "original", poll: null };
+      const state = { jobs: [], selected: null, kind: "original", page: 1, pages: 1, poll: null };
       const $ = (id) => document.getElementById(id);
       const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
       async function request(url, options) {
@@ -88,10 +93,19 @@
         $("jobs").innerHTML = state.jobs.map(job => `<div class="job ${state.selected === job.id ? "active" : ""}" data-id="${job.id}"><strong>${escapeHtml(job.filename)}</strong><small>${escapeHtml(job.status)} · ${escapeHtml(job.stage)} · ${Math.round(job.progress || 0)}%</small><progress max="100" value="${job.progress || 0}"></progress>${job.error ? `<div class="error">${escapeHtml(job.error)}</div>` : ""}</div>`).join("") || "<small>暂无任务</small>";
         document.querySelectorAll(".job").forEach(node => node.onclick = () => selectJob(node.dataset.id));
       }
-      function showFile(kind) {
+      function renderPage() {
+        if (!state.selected) return;
+        $("viewer").src = `/api/jobs/${state.selected}/preview/${state.kind}/${state.page}.png`;
+        $("pageLabel").textContent = `${state.page} / ${state.pages}`;
+        $("prevPage").disabled = state.page <= 1;
+        $("nextPage").disabled = state.page >= state.pages;
+        $("preview").scrollTop = 0;
+      }
+      async function showFile(kind) {
         const job = state.jobs.find(item => item.id === state.selected); if (!job?.files?.[kind]) return;
-        state.kind = kind; $("viewer").src = job.files[kind]; $("viewer").hidden = false; $("empty").hidden = true; $("viewerNav").hidden = false;
-        $("download").href = job.files[kind];
+        state.kind = kind; state.page = 1; const meta = await request(`/api/jobs/${job.id}/preview/${kind}`); state.pages = meta.pages || 1;
+        $("preview").hidden = false; $("empty").hidden = true; $("viewerNav").hidden = false; renderPage();
+        $("download").href = `${job.files[kind]}?download=1`;
         document.querySelectorAll("nav button").forEach(button => button.classList.toggle("active", button.dataset.kind === kind));
       }
       function selectJob(id) {
@@ -110,6 +124,8 @@
       $("uploadForm").onsubmit = event => { event.preventDefault(); const form = new FormData(); form.append("file", $("pdfFile").files[0]); form.append("pages", $("pages").value); form.append("qps", $("qps").value); form.append("skip_scanned_detection", $("skipScan").checked); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/jobs", form); };
       $("sample").onclick = () => { const form = new FormData(); form.append("pages", "1,6"); form.append("qps", $("qps").value); form.append("auto_extract_glossary", $("glossary").checked); submit("/api/sample", form); };
       document.querySelectorAll("nav button").forEach(button => button.onclick = () => showFile(button.dataset.kind));
+      $("prevPage").onclick = () => { if (state.page > 1) { state.page -= 1; renderPage(); } };
+      $("nextPage").onclick = () => { if (state.page < state.pages) { state.page += 1; renderPage(); } };
       Promise.all([loadInfo(), refresh()]).catch(error => $("formError").textContent = error.message);
       state.poll = setInterval(() => refresh().catch(() => {}), 1200);
     </script>
