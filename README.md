@@ -11,7 +11,8 @@
 - 只绑定 `127.0.0.1:8787`，没有公网入口和用户系统。
 - 上传、工作目录和产物位于本项目 `data/`，不会读写 read-paper 数据库。
 - compact IR v1 通过受控 method observer 在内存中提取，保留 BabelDOC 产出的全部原始段落，并包含页级 layouts、段落 bbox/layout、原译文和必要样式；完整 debug IL JSON 不是生产接口。
-- compact IR v1 暂不支持 BabelDOC split parts；worker 会显式拒绝非空 `split_strategy`。
+- 全文任务使用 BabelDOC 单页 split 流程：每页完成排版后立即发布预览 PDF 与该页 compact IR，全部完成后再生成最终译文/双语 PDF。
+- 单页预览 PDF 为 2× 栅格页面，用于低延迟阅读；最终 PDF 保留 BabelDOC 的文本层与完整排版。逐页处理会保留累计标题上下文，但不合并跨页段落。
 
 ## Worker API
 
@@ -21,6 +22,10 @@
 - `GET /api/jobs/{job_id}/files/dual`：双语 PDF。
 - `GET /api/jobs/{job_id}/files/ir`：`read-paper.babeldoc.compact-ir` v1 JSON。
 - `GET /api/jobs/{job_id}/files/manifest`：任务产物清单。
+- `GET /api/jobs/{job_id}/pages/{page}/mono.pdf`：已经完成的单页预览 PDF。
+- `GET /api/jobs/{job_id}/pages/{page}/ir.json`：已经完成的单页 compact IR。
+
+任务状态中的 `available_pages` 是已经可以阅读的连续页前缀，`total_pages` 是全文页数。打开或查询任务不会自动创建翻译；只有 `POST /api/jobs` 会提交任务。
 
 设置 `BABELDOC_WORKER_TOKEN` 后，任务、样本、预览和文件接口要求：
 

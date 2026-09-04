@@ -30,6 +30,16 @@ class RecordingExecutor:
             self.calls.append((function, args))
 
 
+def pdf_bytes(label: str = "test", pages: int = 1) -> bytes:
+    document = pymupdf.open()
+    for index in range(pages):
+        page = document.new_page()
+        page.insert_text((72, 72), f"{label} {index + 1}")
+    data = document.tobytes()
+    document.close()
+    return data
+
+
 def test_info_exposes_pinned_engine_without_secrets() -> None:
     response = TestClient(app.app).get("/api/info")
     assert response.status_code == 200
@@ -145,7 +155,7 @@ def test_status_and_manifest_record_engine_without_secrets(
     monkeypatch.setenv("BABELDOC_API_KEY", "api-secret")
     monkeypatch.setattr(app, "WORKER_TOKEN", "worker-secret")
 
-    job = app._create_job(b"%PDF-1.7\n", "paper.pdf", "", 2, True, False)
+    job = app._create_job(pdf_bytes(), "paper.pdf", "", 2, True, False)
     status_text = (tmp_path / job["id"] / "status.json").read_text(encoding="utf-8")
     status = json.loads(status_text)
     assert status["engine"] == app.ENGINE
@@ -205,10 +215,11 @@ def test_idempotent_concurrent_submit_creates_one_job(
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     monkeypatch.setattr(app, "_executor", executor)
     key = "a" * 32
+    raw = pdf_bytes("concurrent")
 
     def submit(qps: int) -> dict:
         return app._create_job(
-            b"%PDF-1.7\nconcurrent",
+            raw,
             "paper.pdf",
             "1, 6",
             qps,
@@ -234,15 +245,14 @@ def test_idempotency_index_recovers_after_restart(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     monkeypatch.setattr(app, "_executor", executor)
     key = "b" * 64
-    first = app._create_job(b"%PDF-1.7\nrestart", "paper.pdf", "2", 2, True, True, key)
+    raw = pdf_bytes("restart", pages=2)
+    first = app._create_job(raw, "paper.pdf", "2", 2, True, True, key)
     app._patch_job(first["id"], status="completed", stage="完成")
 
     monkeypatch.setattr(app, "_jobs", {})
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     app._load_existing_jobs()
-    restored = app._create_job(
-        b"%PDF-1.7\nrestart", "paper.pdf", "2", 4, True, True, key
-    )
+    restored = app._create_job(raw, "paper.pdf", "2", 4, True, True, key)
 
     assert restored["id"] == first["id"]
     assert restored["status"] == "completed"
@@ -257,17 +267,19 @@ def test_idempotency_conflict_and_failed_retry(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     monkeypatch.setattr(app, "_executor", executor)
     key = "c" * 32
-    first = app._create_job(b"%PDF-1.7\nfirst", "paper.pdf", "1", 2, True, False, key)
+    first_pdf = pdf_bytes("first")
+    second_pdf = pdf_bytes("second")
+    first = app._create_job(first_pdf, "paper.pdf", "1", 2, True, False, key)
 
     with pytest.raises(HTTPException) as source_conflict:
-        app._create_job(b"%PDF-1.7\nsecond", "paper.pdf", "1", 2, True, False, key)
+        app._create_job(second_pdf, "paper.pdf", "1", 2, True, False, key)
     assert source_conflict.value.status_code == 409
     with pytest.raises(HTTPException) as config_conflict:
-        app._create_job(b"%PDF-1.7\nfirst", "paper.pdf", "2", 2, True, False, key)
+        app._create_job(first_pdf, "paper.pdf", "2", 2, True, False, key)
     assert config_conflict.value.status_code == 409
 
     app._patch_job(first["id"], status="failed", stage="失败")
-    retry = app._create_job(b"%PDF-1.7\nfirst", "paper.pdf", "1", 4, True, False, key)
+    retry = app._create_job(first_pdf, "paper.pdf", "1", 4, True, False, key)
     assert retry["id"] != first["id"]
     assert app._idempotency_jobs[key] == retry["id"]
     assert len(executor.calls) == 2
@@ -456,7 +468,9 @@ def test_compact_ir_observer_captures_and_restores_methods(
     assert paragraph_payload["style"]["bold"] is True
 
 
-def test_compact_ir_observer_rejects_split_parts() -> None:
+def test_compact_ir_collector_merges_split_parts_and_writes_one_page(
+    tmp_path: Path,
+) -> None:
     collector = CompactIRCollector(
         source_sha256="hash",
         source_filename="paper.pdf",
@@ -464,11 +478,66 @@ def test_compact_ir_observer_rejects_split_parts() -> None:
         target_language="zh",
         engine={},
     )
-    with (
-        pytest.raises(CompactIRCaptureError, match="split parts"),
-        observe_babeldoc(SimpleNamespace(split_strategy=object()), collector),
-    ):
-        pass
+    first, *_ = _sample_il()
+    second, *_ = _sample_il()
+    collector.capture_source(first, page_offset=0)
+    collector.capture_target(first, page_offset=0)
+    collector.capture_source(second, page_offset=1)
+    collector.capture_target(second, page_offset=1)
+
+    full = collector.to_dict()
+    assert [page["page_number"] for page in full["pages"]] == [1, 2]
+    assert full["pages"][0]["paragraphs"][0]["id"] == "p0001-b0001"
+    assert full["pages"][1]["paragraphs"][0]["id"] == "p0002-b0001"
+    partial_path = collector.write(tmp_path / "page-2.json", page_numbers={2})
+    partial = json.loads(partial_path.read_text(encoding="utf-8"))
+    assert [page["page_number"] for page in partial["pages"]] == [2]
+
+
+def test_publish_page_creates_small_raster_pdf_and_updates_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(app, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        app,
+        "_jobs",
+        {
+            "job-1": {
+                "id": "job-1",
+                "status": "running",
+                "available_pages": [],
+                "total_pages": 2,
+            }
+        },
+    )
+    source = tmp_path / "source.pdf"
+    source.write_bytes(pdf_bytes("incremental", pages=2))
+    document, *_ = _sample_il()
+    collector = CompactIRCollector(
+        source_sha256="hash",
+        source_filename="paper.pdf",
+        source_language="en",
+        target_language="zh",
+        engine={
+            "name": "BabelDOC",
+            "version": "test",
+            "revision": "test",
+            "model": "test",
+        },
+    )
+    collector.capture_source(document)
+    collector.capture_target(document)
+
+    app._publish_page("job-1", 1, source, collector, source_page_index=1)
+    output = tmp_path / "job-1" / "pages" / "0001" / "mono.pdf"
+    with pymupdf.open(output) as preview:
+        assert preview.page_count == 1
+    assert output.stat().st_size < 1_000_000
+    assert app._jobs["job-1"]["available_pages"] == [1]
+    assert app._jobs["job-1"]["partial_revision"] == 1
+    response = TestClient(app.app).get("/api/jobs/job-1/pages/1/mono.pdf")
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF-")
 
 
 def test_compact_ir_refuses_incomplete_observation() -> None:

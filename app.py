@@ -260,9 +260,94 @@ def _write_manifest(job: dict[str, Any], files: dict[str, str]) -> Path:
     return path
 
 
+def _page_dir(job_id: str, page_number: int) -> Path:
+    return _job_dir(job_id) / "pages" / f"{page_number:04d}"
+
+
+def _publish_page(
+    job_id: str,
+    page_number: int,
+    source_pdf: Path,
+    collector: CompactIRCollector,
+    source_page_index: int = 0,
+) -> None:
+    import pymupdf
+
+    page_dir = _page_dir(job_id, page_number)
+    page_dir.mkdir(parents=True, exist_ok=True)
+    destination = page_dir / "mono.pdf"
+    temporary = destination.with_name(f".mono.{secrets.token_hex(8)}.writing.pdf")
+    with pymupdf.open(source_pdf) as document:
+        if source_page_index < 0 or source_page_index >= document.page_count:
+            raise RuntimeError(f"第 {page_number} 页增量产物页码无效")
+        source_page = document[source_page_index]
+        pixmap = source_page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+        with pymupdf.open() as preview:
+            page = preview.new_page(
+                width=source_page.rect.width, height=source_page.rect.height
+            )
+            page.insert_image(page.rect, stream=pixmap.tobytes("png"))
+            preview.save(temporary, garbage=4, deflate=True)
+    temporary.replace(destination)
+    collector.write(page_dir / "ir.json", page_numbers={page_number})
+    with _jobs_lock:
+        current = dict(_jobs[job_id])
+        available_pages = sorted(
+            {int(page) for page in current.get("available_pages") or []} | {page_number}
+        )
+    _patch_job(
+        job_id,
+        available_pages=available_pages,
+        partial_revision=len(available_pages),
+        stage=f"第 {page_number} 页可阅读",
+    )
+
+
+def _publish_part_page(
+    job_id: str,
+    config: Any,
+    collector: CompactIRCollector,
+    page_number: int,
+) -> None:
+    output_dir = config.get_part_output_dir(page_number - 1)
+    candidates = sorted(
+        output_dir.glob("*.mono.pdf"),
+        key=lambda path: ("no_watermark" not in path.name, path.name),
+    )
+    if not candidates:
+        raise RuntimeError(f"第 {page_number} 页 BabelDOC 单页产物缺失")
+    _publish_page(job_id, page_number, candidates[0], collector)
+
+
+def _publish_missing_pages(
+    job_id: str,
+    mono_pdf: Path,
+    collector: CompactIRCollector,
+) -> None:
+    import pymupdf
+
+    with _jobs_lock:
+        available = {int(page) for page in _jobs[job_id].get("available_pages") or []}
+        total_pages = int(_jobs[job_id]["total_pages"])
+    with pymupdf.open(mono_pdf) as document:
+        if document.page_count != total_pages:
+            raise RuntimeError("BabelDOC 最终译文页数与原 PDF 不一致")
+        for page_number in range(1, total_pages + 1):
+            if page_number in available:
+                continue
+            _publish_page(
+                job_id,
+                page_number,
+                mono_pdf,
+                collector,
+                source_page_index=page_number - 1,
+            )
+
+
 async def _translate(job_id: str) -> None:
     from babeldoc.docvision.doclayout import DocLayoutModel
     from babeldoc.format.pdf import high_level
+    from babeldoc.format.pdf.split_manager import PageCountStrategy
     from babeldoc.format.pdf.translation_config import (
         TranslationConfig,
         WatermarkOutputMode,
@@ -323,9 +408,10 @@ async def _translate(job_id: str) -> None:
         primary_font_family="serif",
         report_interval=0.25,
         metadata_extra_data="read-paper-babeldoc-lab",
+        split_strategy=PageCountStrategy(max_pages_per_part=1)
+        if not job.get("pages")
+        else None,
     )
-    if config.split_strategy is not None:
-        raise RuntimeError("compact IR v1 暂不支持 BabelDOC split parts")
 
     collector = CompactIRCollector(
         source_sha256=job["sha256"],
@@ -348,6 +434,14 @@ async def _translate(job_id: str) -> None:
                     progress=max(0.0, min(100.0, progress)),
                     stage=str(event.get("stage") or "处理中"),
                 )
+                if (
+                    event_type == "progress_end"
+                    and event.get("stage") == "Save PDF"
+                    and int(event.get("total_parts") or 1) > 1
+                ):
+                    page_number = int(event.get("part_index") or 0)
+                    if page_number > 0:
+                        _publish_part_page(job_id, config, collector, page_number)
             elif event_type == "error":
                 raise RuntimeError(
                     str(
@@ -360,6 +454,12 @@ async def _translate(job_id: str) -> None:
                 result = event.get("translate_result")
                 if result is None:
                     raise RuntimeError("BabelDOC 完成事件缺少输出结果")
+                mono_pdf = Path(
+                    getattr(result, "no_watermark_mono_pdf_path", None)
+                    or getattr(result, "mono_pdf_path", "")
+                )
+                if not job.get("pages"):
+                    _publish_missing_pages(job_id, mono_pdf, collector)
                 ir_path = collector.write(output_dir / "compact-ir.v1.json")
                 files = _result_files(result, job_id, ir_path)
                 _write_manifest(job, files)
@@ -369,6 +469,12 @@ async def _translate(job_id: str) -> None:
                     progress=100.0,
                     stage="完成",
                     files=files,
+                    available_pages=list(range(1, int(job["total_pages"]) + 1))
+                    if not job.get("pages")
+                    else [],
+                    partial_revision=int(job["total_pages"])
+                    if not job.get("pages")
+                    else 0,
                     metrics={
                         "seconds": round(
                             float(getattr(result, "total_seconds", 0) or 0), 2
@@ -407,8 +513,17 @@ def _create_job(
 ) -> dict[str, Any]:
     if not raw.startswith(b"%PDF-"):
         raise HTTPException(400, "文件内容不是 PDF")
-    digest = hashlib.sha256(raw).hexdigest()
     normalized_key = _normalize_idempotency_key(idempotency_key)
+    try:
+        import pymupdf
+
+        with pymupdf.open(stream=raw, filetype="pdf") as document:
+            total_pages = int(document.page_count)
+    except Exception as exc:
+        raise HTTPException(400, "文件内容不是有效的 PDF") from exc
+    if total_pages < 1:
+        raise HTTPException(400, "PDF 没有可处理页面")
+    digest = hashlib.sha256(raw).hexdigest()
     normalized_pages = _normalize_pages(pages)
     requested_signature = (
         digest,
@@ -444,6 +559,9 @@ def _create_job(
             "status": "queued",
             "stage": "排队中",
             "progress": 0.0,
+            "total_pages": total_pages,
+            "available_pages": [],
+            "partial_revision": 0,
             "error": None,
             "files": {"original": f"/api/jobs/{job_id}/files/original"},
             "pages": normalized_pages,
@@ -496,7 +614,9 @@ def info() -> dict[str, Any]:
             os.getenv("BABELDOC_API_KEY") or os.getenv("GLM_API_KEY")
         ),
         "auth_required": bool(WORKER_TOKEN),
-        "split_parts_supported": False,
+        "split_parts_supported": True,
+        "incremental_pages": True,
+        "worker_api_version": 2,
         "sample_available": Path(os.getenv("BABELDOC_SAMPLE_PDF", "")).is_file(),
         "table_notice": TABLE_NOTICE,
     }
@@ -568,6 +688,27 @@ def get_file(job_id: str, kind: str, download: bool = False):
         media_type="application/pdf" if is_pdf else "application/json",
         filename=path.name,
         content_disposition_type="attachment" if download else "inline",
+    )
+
+
+@app.get("/api/jobs/{job_id}/pages/{page_number}/{kind}", dependencies=AUTH_REQUIRED)
+def get_page_file(job_id: str, page_number: int, kind: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if (
+        not job
+        or kind not in {"mono.pdf", "ir.json"}
+        or page_number not in {int(page) for page in job.get("available_pages") or []}
+    ):
+        raise HTTPException(404, "增量页面不存在")
+    path = _page_dir(job_id, page_number) / kind
+    if not path.is_file():
+        raise HTTPException(404, "增量页面不存在")
+    return FileResponse(
+        path,
+        media_type="application/pdf" if kind.endswith(".pdf") else "application/json",
+        filename=path.name,
+        content_disposition_type="inline",
     )
 
 

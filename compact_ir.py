@@ -186,21 +186,26 @@ class CompactIRCollector:
         self.source_language = source_language
         self.target_language = target_language
         self.engine = copy.deepcopy(engine)
-        self._source_capture_count = 0
-        self._target_capture_count = 0
-        self._pages: list[dict[str, Any]] = []
+        self._source_offsets: set[int] = set()
+        self._target_offsets: set[int] = set()
+        self._pages_by_index: dict[int, dict[str, Any]] = {}
         self._paragraphs_by_object_id: dict[int, dict[str, Any]] = {}
+        self._object_ids_by_offset: dict[int, set[int]] = {}
 
-    def capture_source(self, document: Any) -> None:
-        self._source_capture_count += 1
-        if self._source_capture_count != 1:
+    def capture_source(self, document: Any, *, page_offset: int = 0) -> None:
+        if page_offset in self._source_offsets:
             raise CompactIRCaptureError(
-                "compact IR 暂不支持 split parts：检测到多次 source capture"
+                f"compact IR source part {page_offset} 重复捕获"
             )
+        self._source_offsets.add(page_offset)
+        part_object_ids: set[int] = set()
 
         for page in getattr(document, "page", []) or []:
-            page_index = int(getattr(page, "page_number", 0) or 0)
+            local_page_index = int(getattr(page, "page_number", 0) or 0)
+            page_index = page_offset + local_page_index
             page_number = page_index + 1
+            if page_index in self._pages_by_index:
+                raise CompactIRCaptureError(f"compact IR 第 {page_number} 页重复捕获")
             page_box_obj = getattr(getattr(page, "mediabox", None), "box", None)
             page_box = _box(page_box_obj) or [0.0, 0.0, 0.0, 0.0]
             page_record: dict[str, Any] = {
@@ -248,16 +253,20 @@ class CompactIRCollector:
                 }
                 page_record["paragraphs"].append(paragraph_record)
                 self._paragraphs_by_object_id[id(paragraph)] = paragraph_record
-            self._pages.append(page_record)
+                part_object_ids.add(id(paragraph))
+            self._pages_by_index[page_index] = page_record
+        self._object_ids_by_offset[page_offset] = part_object_ids
 
-    def capture_target(self, document: Any) -> None:
-        self._target_capture_count += 1
-        if self._target_capture_count != 1:
+    def capture_target(self, document: Any, *, page_offset: int = 0) -> None:
+        if page_offset in self._target_offsets:
             raise CompactIRCaptureError(
-                "compact IR 暂不支持 split parts：检测到多次 target capture"
+                f"compact IR target part {page_offset} 重复捕获"
             )
-        if self._source_capture_count != 1:
-            raise CompactIRCaptureError("BabelDOC target hook 先于 source hook 触发")
+        if page_offset not in self._source_offsets:
+            raise CompactIRCaptureError(
+                f"BabelDOC target hook 先于 source hook 触发：part {page_offset}"
+            )
+        self._target_offsets.add(page_offset)
 
         captured: set[int] = set()
         for page in getattr(document, "page", []) or []:
@@ -270,17 +279,24 @@ class CompactIRCollector:
                 record["target_runs"] = _runs(paragraph, fonts)
                 captured.add(id(paragraph))
 
-        missing = set(self._paragraphs_by_object_id) - captured
+        missing = self._object_ids_by_offset.get(page_offset, set()) - captured
         if missing:
             raise CompactIRCaptureError(
                 f"BabelDOC 翻译后缺少 {len(missing)} 个源段落，拒绝生成不完整 compact IR"
             )
 
-    def to_dict(self) -> dict[str, Any]:
-        if self._source_capture_count != 1 or self._target_capture_count != 1:
+    def to_dict(self, *, page_numbers: set[int] | None = None) -> dict[str, Any]:
+        if not self._source_offsets or self._source_offsets != self._target_offsets:
             raise CompactIRCaptureError(
                 "BabelDOC observer 未完整捕获 source/target，拒绝静默生成 IR"
             )
+        pages = sorted(
+            self._pages_by_index.values(), key=lambda page: page["page_index"]
+        )
+        if page_numbers is not None:
+            pages = [page for page in pages if int(page["page_number"]) in page_numbers]
+            if {int(page["page_number"]) for page in pages} != page_numbers:
+                raise CompactIRCaptureError("请求发布的页面尚未完整捕获")
         return {
             "schema": "read-paper.babeldoc.compact-ir",
             "schema_version": 1,
@@ -291,11 +307,11 @@ class CompactIRCollector:
                 "language": self.source_language,
             },
             "target_language": self.target_language,
-            "pages": sorted(self._pages, key=lambda page: page["page_index"]),
+            "pages": pages,
         }
 
-    def write(self, path: Path) -> Path:
-        payload = self.to_dict()
+    def write(self, path: Path, *, page_numbers: set[int] | None = None) -> Path:
+        payload = self.to_dict(page_numbers=page_numbers)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".writing")
         temporary.write_text(
@@ -311,9 +327,7 @@ _OBSERVER_LOCK = threading.Lock()
 
 @contextmanager
 def observe_babeldoc(config: Any, collector: CompactIRCollector) -> Iterator[None]:
-    if getattr(config, "split_strategy", None) is not None:
-        raise CompactIRCaptureError("compact IR v1 暂不支持 BabelDOC split parts")
-
+    from babeldoc.format.pdf import high_level
     from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
     from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
         ILTranslatorLLMOnly,
@@ -323,31 +337,52 @@ def observe_babeldoc(config: Any, collector: CompactIRCollector) -> Iterator[Non
     )
 
     with _OBSERVER_LOCK:
+        current_part = threading.local()
+        original_do_translate_single = high_level._do_translate_single
         original_styles_process = StylesAndFormulas.process
         original_il_translate = ILTranslator.translate
         original_llm_translate = ILTranslatorLLMOnly.translate
 
+        def do_translate_single(progress_monitor: Any, part_config: Any):
+            parent = getattr(progress_monitor, "parent_monitor", None)
+            page_offset = (
+                int(getattr(progress_monitor, "part_index", 0) or 0) if parent else 0
+            )
+            current_part.page_offset = page_offset
+            try:
+                return original_do_translate_single(progress_monitor, part_config)
+            finally:
+                current_part.page_offset = 0
+
         def styles_process(instance: Any, document: Any):
             result = original_styles_process(instance, document)
-            collector.capture_source(document)
+            collector.capture_source(
+                document, page_offset=int(getattr(current_part, "page_offset", 0))
+            )
             return result
 
         def il_translate(instance: Any, document: Any):
             result = original_il_translate(instance, document)
-            collector.capture_target(document)
+            collector.capture_target(
+                document, page_offset=int(getattr(current_part, "page_offset", 0))
+            )
             return result
 
         def llm_translate(instance: Any, document: Any):
             result = original_llm_translate(instance, document)
-            collector.capture_target(document)
+            collector.capture_target(
+                document, page_offset=int(getattr(current_part, "page_offset", 0))
+            )
             return result
 
+        high_level._do_translate_single = do_translate_single
         StylesAndFormulas.process = styles_process
         ILTranslator.translate = il_translate
         ILTranslatorLLMOnly.translate = llm_translate
         try:
             yield
         finally:
+            high_level._do_translate_single = original_do_translate_single
             StylesAndFormulas.process = original_styles_process
             ILTranslator.translate = original_il_translate
             ILTranslatorLLMOnly.translate = original_llm_translate
