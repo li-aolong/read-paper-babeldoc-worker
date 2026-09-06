@@ -3,6 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
+
 if [ -z "${BABELDOC_API_KEY:-}" ] && [ -n "${GLM_API_KEY:-}" ]; then
   export BABELDOC_API_KEY="$GLM_API_KEY"
 fi

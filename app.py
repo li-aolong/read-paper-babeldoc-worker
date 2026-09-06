@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from compact_ir import CompactIRCollector, observe_babeldoc
+from outbound_url import UnsafeOutboundUrl, validate_outbound_url
+from translation_guard import TranslationGuard
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.getenv("BABELDOC_LAB_DATA", ROOT / "data")).resolve()
@@ -39,6 +41,7 @@ _jobs_lock = threading.RLock()
 _preview_lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 _idempotency_jobs: dict[str, str] = {}
+_job_credentials: dict[str, dict[str, str]] = {}
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="BabelDOC 本地效果实验", docs_url=None, redoc_url=None)
@@ -90,6 +93,34 @@ def _inspect_babeldoc_runtime() -> tuple[dict[str, str | None], str | None]:
 
 
 ENGINE, ENGINE_VALIDATION_ERROR = _inspect_babeldoc_runtime()
+
+
+def _allowed_models() -> list[str]:
+    configured = os.getenv("BABELDOC_MODELS", str(ENGINE["model"] or ""))
+    return list(
+        dict.fromkeys(value.strip() for value in configured.split(",") if value.strip())
+    )
+
+
+def _default_model() -> str:
+    allowed = _allowed_models()
+    configured = str(ENGINE["model"] or "")
+    return configured if configured in allowed else (allowed[0] if allowed else "")
+
+
+def _provider_fingerprint(source: str, provider: str, base_url: str) -> str:
+    value = json.dumps(
+        [source, provider, base_url.strip().rstrip("/")], separators=(",", ":")
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _worker_base_url() -> str:
+    return (
+        os.getenv("BABELDOC_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+        .strip()
+        .rstrip("/")
+    )
 
 
 def _require_worker_auth(
@@ -154,6 +185,8 @@ def _idempotency_signature(job: dict[str, Any]) -> tuple[Any, ...]:
         _normalize_pages(str(job.get("pages") or "")),
         bool(job.get("skip_scanned_detection")),
         bool(job.get("auto_extract_glossary")),
+        job.get("model"),
+        job.get("provider_fingerprint"),
     )
 
 
@@ -187,6 +220,12 @@ def _load_existing_jobs() -> None:
                 status="failed",
                 error="本地服务重启，任务已中断，请重新提交。",
                 updated_at=_now(),
+            )
+            if job.get("model_source") == "user":
+                job["error"] = "服务重启后用户 API 凭据已清除，请显式重新提交任务。"
+            path.write_text(
+                json.dumps(_public_job(job), ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
         job.setdefault("engine", dict(ENGINE))
         job.setdefault("babeldoc_version", ENGINE["version"])
@@ -249,6 +288,7 @@ def _write_manifest(job: dict[str, Any], files: dict[str, str]) -> Path:
         "lang_in": job["lang_in"],
         "lang_out": job["lang_out"],
         "model": job["model"],
+        "provider_fingerprint": job.get("provider_fingerprint"),
         "engine": dict(job["engine"]),
         "files": dict(files),
     }
@@ -344,6 +384,28 @@ def _publish_missing_pages(
             )
 
 
+def _make_translator(job: dict[str, Any], base_url: str, api_key: str):
+    from babeldoc.translator.translator import OpenAITranslator
+
+    translator = OpenAITranslator(
+        lang_in=job["lang_in"],
+        lang_out=job["lang_out"],
+        model=job["model"],
+        base_url=base_url,
+        api_key=api_key,
+        ignore_cache=False,
+        enable_json_mode_if_requested=False,
+        send_temperature=True,
+    )
+    # BabelDOC's built-in cache only keys the model, not its API provider.
+    # Keep every job isolated, with no credential material in cache parameters.
+    translator.add_cache_impact_parameters(
+        "provider_fingerprint", job["provider_fingerprint"]
+    )
+    translator.add_cache_impact_parameters("job_id", job["id"])
+    return translator
+
+
 async def _translate(job_id: str) -> None:
     from babeldoc.docvision.doclayout import DocLayoutModel
     from babeldoc.format.pdf import high_level
@@ -353,7 +415,6 @@ async def _translate(job_id: str) -> None:
         WatermarkOutputMode,
     )
     from babeldoc.translator.translator import (
-        OpenAITranslator,
         set_translate_rate_limiter,
     )
 
@@ -362,11 +423,19 @@ async def _translate(job_id: str) -> None:
 
     with _jobs_lock:
         job = dict(_jobs[job_id])
-    api_key = os.getenv("BABELDOC_API_KEY", "").strip()
-    base_url = os.getenv(
-        "BABELDOC_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
-    ).strip()
-    model = str(job["engine"]["model"] or "").strip()
+        credentials = dict(_job_credentials.get(job_id) or {})
+    if job.get("model_source") == "user":
+        if not credentials:
+            raise RuntimeError("用户 API 凭据已清除，请显式重新提交任务。")
+        api_key = credentials["api_key"]
+        base_url = await validate_outbound_url(
+            credentials["api_base_url"],
+            allow_private=os.getenv("BABELDOC_ALLOW_PRIVATE_AI_URLS", "").lower()
+            == "true",
+        )
+    else:
+        api_key = os.getenv("BABELDOC_API_KEY", "").strip()
+        base_url = _worker_base_url()
     if not api_key:
         raise RuntimeError(
             "缺少 BABELDOC_API_KEY；请通过 run.sh 继承 GLM_API_KEY 或显式设置。"
@@ -377,16 +446,9 @@ async def _translate(job_id: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    translator = OpenAITranslator(
-        lang_in=job["lang_in"],
-        lang_out=job["lang_out"],
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        ignore_cache=False,
-        enable_json_mode_if_requested=False,
-        send_temperature=True,
-    )
+    translator = _make_translator(job, base_url, api_key)
+    guard = TranslationGuard(lambda reason: _patch_job(job_id, waiting_reason=reason))
+    guard.attach(translator)
     set_translate_rate_limiter(int(job["qps"]))
     layout_model = DocLayoutModel.load_onnx()
     config = TranslationConfig(
@@ -413,6 +475,17 @@ async def _translate(job_id: str) -> None:
         else None,
     )
 
+    def cancel_failed_translation() -> None:
+        if guard.failure is not None:
+            _patch_job(
+                job_id,
+                error_code=guard.failure.code,
+                error=str(guard.failure),
+                waiting_reason=None,
+            )
+        config.cancel_translation()
+
+    guard.cancel = cancel_failed_translation
     collector = CompactIRCollector(
         source_sha256=job["sha256"],
         source_filename=job["filename"],
@@ -421,8 +494,12 @@ async def _translate(job_id: str) -> None:
         engine=job["engine"],
     )
     high_level.init()
-    with observe_babeldoc(config, collector):
+    with (
+        translator.client,
+        observe_babeldoc(config, collector, check_translation=guard.check),
+    ):
         async for event in high_level.async_translate(config):
+            guard.check()
             event_type = event.get("type")
             if event_type in {"progress_start", "progress_update", "progress_end"}:
                 progress = float(
@@ -493,13 +570,34 @@ async def _translate(job_id: str) -> None:
 
 def _run_job(job_id: str) -> None:
     _patch_job(
-        job_id, status="running", stage="初始化 BabelDOC", progress=0.0, error=None
+        job_id,
+        status="running",
+        stage="初始化 BabelDOC",
+        progress=0.0,
+        error=None,
+        error_code=None,
+        waiting_reason=None,
     )
     try:
         asyncio.run(_translate(job_id))
-    except Exception as exc:
-        logger.exception("BabelDOC job %s failed", job_id)
-        _patch_job(job_id, status="failed", stage="失败", error=str(exc)[:2000])
+    except Exception as exc:  # noqa: BLE001 — task boundary; redact SDK details
+        # SDK exceptions can contain request details: never persist/log their text.
+        logger.error("BabelDOC job %s failed (%s)", job_id, type(exc).__name__)
+        with _jobs_lock:
+            failure = dict(_jobs[job_id])
+        _patch_job(
+            job_id,
+            status="failed",
+            stage="失败",
+            error=failure.get("error")
+            if failure.get("error_code")
+            else "翻译未完成，请检查模型配置或更换模型后重试。",
+            error_code=failure.get("error_code") or "translation_failed",
+            waiting_reason=None,
+        )
+    finally:
+        with _jobs_lock:
+            _job_credentials.pop(job_id, None)
 
 
 def _create_job(
@@ -510,7 +608,26 @@ def _create_job(
     skip_scanned_detection: bool,
     auto_extract_glossary: bool,
     idempotency_key: str | None = None,
+    model: str | None = None,
+    credentials: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    selected_model = model.strip() if model is not None else _default_model()
+    source = "user" if credentials else "worker"
+    if credentials and not WORKER_TOKEN:
+        raise HTTPException(503, "用户 API 配置需要部署者设置 worker Bearer token")
+    if (
+        not selected_model
+        or selected_model.startswith("free:")
+        or len(selected_model) > 256
+    ):
+        raise HTTPException(422, "无效的 BabelDOC 模型")
+    if not credentials and selected_model not in _allowed_models():
+        raise HTTPException(422, "模型不在部署者允许的 BABELDOC_MODELS 列表中")
+    fingerprint = _provider_fingerprint(
+        source,
+        credentials.get("provider", "custom") if credentials else "worker",
+        credentials["api_base_url"] if credentials else _worker_base_url(),
+    )
     if not raw.startswith(b"%PDF-"):
         raise HTTPException(400, "文件内容不是 PDF")
     normalized_key = _normalize_idempotency_key(idempotency_key)
@@ -530,6 +647,8 @@ def _create_job(
         normalized_pages,
         bool(skip_scanned_detection),
         bool(auto_extract_glossary),
+        selected_model,
+        fingerprint,
     )
 
     with _jobs_lock:
@@ -572,17 +691,27 @@ def _create_job(
             "babeldoc_revision": ENGINE["revision"],
             "lang_in": "en",
             "lang_out": "zh",
-            "engine": dict(ENGINE),
-            "model": ENGINE["model"],
+            "engine": {**ENGINE, "model": selected_model},
+            "model": selected_model,
+            "model_source": source,
+            "provider_fingerprint": fingerprint,
             "table_notice": TABLE_NOTICE,
             "created_at": now,
             "updated_at": now,
             "_input_path": str(input_path),
         }
         _write_status(job)
+        if credentials:
+            _job_credentials[job_id] = dict(credentials)
         if normalized_key:
             _idempotency_jobs[normalized_key] = job_id
-    _executor.submit(_run_job, job_id)
+    try:
+        _executor.submit(_run_job, job_id)
+    except RuntimeError:
+        with _jobs_lock:
+            _job_credentials.pop(job_id, None)
+        _patch_job(job_id, status="failed", error="任务调度失败，请显式重新提交。")
+        raise HTTPException(503, "任务调度失败，请显式重新提交。") from None
     return _public_job(job)
 
 
@@ -609,7 +738,12 @@ def info() -> dict[str, Any]:
         "lang_out": "zh",
         "engine": dict(ENGINE),
         "engine_valid": ENGINE_VALIDATION_ERROR is None,
-        "model": ENGINE["model"],
+        "model": _default_model(),
+        "models": _allowed_models(),
+        "provider_fingerprint": _provider_fingerprint(
+            "worker", "worker", _worker_base_url()
+        ),
+        "user_provider_overrides": bool(WORKER_TOKEN),
         "api_configured": bool(
             os.getenv("BABELDOC_API_KEY") or os.getenv("GLM_API_KEY")
         ),
@@ -646,7 +780,30 @@ async def create_job(
     skip_scanned_detection: Annotated[bool, Form()] = True,
     auto_extract_glossary: Annotated[bool, Form()] = False,
     idempotency_key: Annotated[str | None, Form()] = None,
+    model: Annotated[str | None, Form()] = None,
+    api_base_url: Annotated[str | None, Form()] = None,
+    api_key: Annotated[str | None, Form()] = None,
+    provider: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
+    credentials = None
+    if api_base_url is not None or api_key is not None or provider is not None:
+        if not WORKER_TOKEN:
+            raise HTTPException(503, "用户 API 配置需要部署者设置 worker Bearer token")
+        if not api_base_url or not api_key or not model:
+            raise HTTPException(422, "用户模式必须提供 model、api_base_url 和 api_key")
+        try:
+            safe_url = await validate_outbound_url(
+                api_base_url,
+                allow_private=os.getenv("BABELDOC_ALLOW_PRIVATE_AI_URLS", "").lower()
+                == "true",
+            )
+        except UnsafeOutboundUrl as exc:
+            raise HTTPException(400, f"Base URL 不安全：{exc}") from None
+        credentials = {
+            "api_base_url": safe_url,
+            "api_key": api_key,
+            "provider": provider or "custom",
+        }
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, "只支持 PDF 文件")
     raw = await _read_upload(file)
@@ -658,6 +815,8 @@ async def create_job(
         skip_scanned_detection,
         auto_extract_glossary,
         idempotency_key,
+        model,
+        credentials,
     )
 
 

@@ -483,6 +483,14 @@ def test_compact_ir_collector_merges_split_parts_and_writes_one_page(
     collector.capture_source(first, page_offset=0)
     collector.capture_target(first, page_offset=0)
     collector.capture_source(second, page_offset=1)
+    # Save PDF 事件与下一页解析交错时，已经完成的第一页仍可立即发布。
+    ready = collector.to_dict(page_numbers={1})
+    assert [page["page_number"] for page in ready["pages"]] == [1]
+    with pytest.raises(CompactIRCaptureError, match="尚未完整捕获"):
+        collector.to_dict(page_numbers={2})
+    with pytest.raises(CompactIRCaptureError, match="未完整捕获"):
+        collector.to_dict()
+    ready["pages"][0]["paragraphs"].clear()
     collector.capture_target(second, page_offset=1)
 
     full = collector.to_dict()

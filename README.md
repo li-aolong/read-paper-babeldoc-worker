@@ -18,7 +18,7 @@
 
 - `POST /api/jobs`：提交 PDF。可选 Form 字段 `idempotency_key`，只接受 32 或 64 位小写十六进制字符串。
 - `GET /api/jobs/{job_id}`：查询状态。状态包含 `engine`、版本、revision 和模型，不包含 API key 或 worker token。
-- `GET /api/jobs/{job_id}/files/mono`：纯译文 PDF。
+- `GET /api/jobs/{job_id}/files/mono`：译文 PDF。
 - `GET /api/jobs/{job_id}/files/dual`：双语 PDF。
 - `GET /api/jobs/{job_id}/files/ir`：`read-paper.babeldoc.compact-ir` v1 JSON。
 - `GET /api/jobs/{job_id}/files/manifest`：任务产物清单。
@@ -26,6 +26,10 @@
 - `GET /api/jobs/{job_id}/pages/{page}/ir.json`：已经完成的单页 compact IR。
 
 任务状态中的 `available_pages` 是已经可以阅读的连续页前缀，`total_pages` 是全文页数。打开或查询任务不会自动创建翻译；只有 `POST /api/jobs` 会提交任务。
+
+`GET /api/info` 返回 `models` 允许名单和 `user_provider_overrides`。提交任务可携带 `model`；未指定时用默认模型，未授权的模型会被拒绝。设置 worker token 后，可信后端可传递 `api_base_url`、`api_key` 和 `provider` 使用个人模型，密钥只在内存中保留至任务结束，不写入状态或产物。提供商身份参与缓存隔离，重启后不自动恢复需个人凭据的任务。
+
+模型接口限流或短暂故障最多尝试 4 次，单次请求超时 60 秒。重试期间返回 `waiting_reason`；失败返回脱敏的 `error_code` 和中文提示，保留已发布页。上游即使吞掉段落异常，也不会将不完整页面发布为已完成。
 
 设置 `BABELDOC_WORKER_TOKEN` 后，任务、样本、预览和文件接口要求：
 
@@ -44,6 +48,8 @@ Authorization: Bearer <BABELDOC_WORKER_TOKEN>
 ```
 
 打开 <http://127.0.0.1:8787>。`run.sh` 会从交互 shell 继承已有密钥，但不会把密钥写入项目或命令行参数。
+
+`run.sh` 也会读取本地、被 Git 忽略的 `.env`。可在其中设置 `BABELDOC_MODELS=glm-4-flash-250414,glm-4.7-flash` 提供模型选项；默认模型仍由 `BABELDOC_MODEL` 决定。
 
 可覆盖配置：
 

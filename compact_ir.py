@@ -188,6 +188,7 @@ class CompactIRCollector:
         self.engine = copy.deepcopy(engine)
         self._source_offsets: set[int] = set()
         self._target_offsets: set[int] = set()
+        self._completed_page_numbers: set[int] = set()
         self._pages_by_index: dict[int, dict[str, Any]] = {}
         self._paragraphs_by_object_id: dict[int, dict[str, Any]] = {}
         self._object_ids_by_offset: dict[int, set[int]] = {}
@@ -266,8 +267,6 @@ class CompactIRCollector:
             raise CompactIRCaptureError(
                 f"BabelDOC target hook 先于 source hook 触发：part {page_offset}"
             )
-        self._target_offsets.add(page_offset)
-
         captured: set[int] = set()
         for page in getattr(document, "page", []) or []:
             for paragraph in getattr(page, "pdf_paragraph", []) or []:
@@ -284,19 +283,29 @@ class CompactIRCollector:
             raise CompactIRCaptureError(
                 f"BabelDOC 翻译后缺少 {len(missing)} 个源段落，拒绝生成不完整 compact IR"
             )
+        self._target_offsets.add(page_offset)
+        self._completed_page_numbers.update(
+            page_offset + int(getattr(page, "page_number", 0) or 0) + 1
+            for page in getattr(document, "page", []) or []
+        )
 
     def to_dict(self, *, page_numbers: set[int] | None = None) -> dict[str, Any]:
-        if not self._source_offsets or self._source_offsets != self._target_offsets:
+        if page_numbers is None and (
+            not self._source_offsets or self._source_offsets != self._target_offsets
+        ):
             raise CompactIRCaptureError(
                 "BabelDOC observer 未完整捕获 source/target，拒绝静默生成 IR"
             )
-        pages = sorted(
-            self._pages_by_index.values(), key=lambda page: page["page_index"]
+        selected = (
+            self._completed_page_numbers if page_numbers is None else page_numbers
         )
-        if page_numbers is not None:
-            pages = [page for page in pages if int(page["page_number"]) in page_numbers]
-            if {int(page["page_number"]) for page in pages} != page_numbers:
-                raise CompactIRCaptureError("请求发布的页面尚未完整捕获")
+        if not selected or not selected.issubset(self._completed_page_numbers):
+            raise CompactIRCaptureError("请求发布的页面尚未完整捕获")
+        # 后一页可能已开始解析；发布前一页只需要验证该页的译文已完整捕获。
+        pages = [
+            copy.deepcopy(self._pages_by_index[number - 1])
+            for number in sorted(selected)
+        ]
         return {
             "schema": "read-paper.babeldoc.compact-ir",
             "schema_version": 1,
@@ -326,7 +335,9 @@ _OBSERVER_LOCK = threading.Lock()
 
 
 @contextmanager
-def observe_babeldoc(config: Any, collector: CompactIRCollector) -> Iterator[None]:
+def observe_babeldoc(
+    config: Any, collector: CompactIRCollector, *, check_translation: Any = None
+) -> Iterator[None]:
     from babeldoc.format.pdf import high_level
     from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
     from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
@@ -363,6 +374,8 @@ def observe_babeldoc(config: Any, collector: CompactIRCollector) -> Iterator[Non
 
         def il_translate(instance: Any, document: Any):
             result = original_il_translate(instance, document)
+            if check_translation is not None:
+                check_translation()
             collector.capture_target(
                 document, page_offset=int(getattr(current_part, "page_offset", 0))
             )
@@ -370,6 +383,8 @@ def observe_babeldoc(config: Any, collector: CompactIRCollector) -> Iterator[Non
 
         def llm_translate(instance: Any, document: Any):
             result = original_llm_translate(instance, document)
+            if check_translation is not None:
+                check_translation()
             collector.capture_target(
                 document, page_offset=int(getattr(current_part, "page_offset", 0))
             )
