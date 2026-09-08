@@ -193,6 +193,24 @@ class CompactIRCollector:
         self._paragraphs_by_object_id: dict[int, dict[str, Any]] = {}
         self._object_ids_by_offset: dict[int, set[int]] = {}
 
+    def capture_original_page(self, page: Any, *, page_number: int) -> None:
+        page_index = page_number - 1
+        if page_index in self._pages_by_index:
+            raise CompactIRCaptureError(f"compact IR 第 {page_number} 页重复捕获")
+        self._pages_by_index[page_index] = {
+            "page_index": page_index,
+            "page_number": page_number,
+            "unit": "pt",
+            "coordinate_space": "pdf_points_bottom_left",
+            "bbox": list(page.mediabox),
+            "layouts": [],
+            "paragraphs": [],
+            "translation_status": "skipped",
+        }
+        self._source_offsets.add(page_index)
+        self._target_offsets.add(page_index)
+        self._completed_page_numbers.add(page_number)
+
     def capture_source(self, document: Any, *, page_offset: int = 0) -> None:
         if page_offset in self._source_offsets:
             raise CompactIRCaptureError(
@@ -336,7 +354,8 @@ _OBSERVER_LOCK = threading.Lock()
 
 @contextmanager
 def observe_babeldoc(
-    config: Any, collector: CompactIRCollector, *, check_translation: Any = None
+    config: Any, collector: CompactIRCollector, *, check_translation: Any = None,
+    untranslated_part: Any = None, part_completed: Any = None,
 ) -> Iterator[None]:
     from babeldoc.format.pdf import high_level
     from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
@@ -361,7 +380,15 @@ def observe_babeldoc(
             )
             current_part.page_offset = page_offset
             try:
-                return original_do_translate_single(progress_monitor, part_config)
+                if untranslated_part is not None and part_config.page_ranges == []:
+                    result = untranslated_part(part_config, collector, page_offset + 1)
+                else:
+                    result = original_do_translate_single(progress_monitor, part_config)
+                if check_translation is not None:
+                    check_translation()
+                if part_completed is not None:
+                    part_completed(part_config, page_offset + 1, result)
+                return result
             finally:
                 current_part.page_offset = 0
 

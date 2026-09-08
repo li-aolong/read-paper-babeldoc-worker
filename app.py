@@ -175,14 +175,36 @@ def _normalize_idempotency_key(value: str | None) -> str | None:
     return value
 
 
-def _normalize_pages(value: str) -> str:
-    return ",".join(part.strip() for part in value.strip().split(","))
+def _normalize_pages(value: str, total_pages: int | None = None) -> str:
+    if not value.strip():
+        return ""
+    selected: set[int] = set()
+    for part in value.split(","):
+        match = re.fullmatch(r"\s*([0-9]+)\s*(?:-\s*([0-9]+)\s*)?", part)
+        if match is None:
+            raise HTTPException(422, "页码格式应为 1-3,5")
+        start = int(match[1])
+        end = int(match[2] or match[1])
+        if start < 1 or end < start or (total_pages is not None and end > total_pages):
+            raise HTTPException(422, "页码范围无效或超出 PDF 总页数")
+        selected.update(range(start, end + 1))
+    ranges: list[str] = []
+    ordered = sorted(selected)
+    start = end = ordered[0]
+    for page in ordered[1:]:
+        if page == end + 1:
+            end = page
+        else:
+            ranges.append(str(start) if start == end else f"{start}-{end}")
+            start = end = page
+    ranges.append(str(start) if start == end else f"{start}-{end}")
+    return ",".join(ranges)
 
 
 def _idempotency_signature(job: dict[str, Any]) -> tuple[Any, ...]:
     return (
         job.get("sha256"),
-        _normalize_pages(str(job.get("pages") or "")),
+        _normalize_pages(str(job.get("pages") or ""), job.get("total_pages")),
         bool(job.get("skip_scanned_detection")),
         bool(job.get("auto_extract_glossary")),
         job.get("model"),
@@ -289,6 +311,8 @@ def _write_manifest(job: dict[str, Any], files: dict[str, str]) -> Path:
         "lang_out": job["lang_out"],
         "model": job["model"],
         "provider_fingerprint": job.get("provider_fingerprint"),
+        "pages": job.get("pages") or "",
+        "requested_pages": job.get("requested_pages"),
         "engine": dict(job["engine"]),
         "files": dict(files),
     }
@@ -310,6 +334,7 @@ def _publish_page(
     source_pdf: Path,
     collector: CompactIRCollector,
     source_page_index: int = 0,
+    translated: bool = True,
 ) -> None:
     import pymupdf
 
@@ -335,28 +360,19 @@ def _publish_page(
         available_pages = sorted(
             {int(page) for page in current.get("available_pages") or []} | {page_number}
         )
+        if available_pages != list(range(1, len(available_pages) + 1)):
+            raise RuntimeError("增量页面必须按原始页序发布")
+        translated_pages = sorted(
+            set(current.get("translated_pages") or [])
+            | ({page_number} if translated else set())
+        )
     _patch_job(
         job_id,
         available_pages=available_pages,
         partial_revision=len(available_pages),
+        translated_pages=translated_pages,
         stage=f"第 {page_number} 页可阅读",
     )
-
-
-def _publish_part_page(
-    job_id: str,
-    config: Any,
-    collector: CompactIRCollector,
-    page_number: int,
-) -> None:
-    output_dir = config.get_part_output_dir(page_number - 1)
-    candidates = sorted(
-        output_dir.glob("*.mono.pdf"),
-        key=lambda path: ("no_watermark" not in path.name, path.name),
-    )
-    if not candidates:
-        raise RuntimeError(f"第 {page_number} 页 BabelDOC 单页产物缺失")
-    _publish_page(job_id, page_number, candidates[0], collector)
 
 
 def _publish_missing_pages(
@@ -369,6 +385,7 @@ def _publish_missing_pages(
     with _jobs_lock:
         available = {int(page) for page in _jobs[job_id].get("available_pages") or []}
         total_pages = int(_jobs[job_id]["total_pages"])
+        requested = set(_jobs[job_id].get("requested_pages", range(1, total_pages + 1)))
     with pymupdf.open(mono_pdf) as document:
         if document.page_count != total_pages:
             raise RuntimeError("BabelDOC 最终译文页数与原 PDF 不一致")
@@ -381,7 +398,28 @@ def _publish_missing_pages(
                 mono_pdf,
                 collector,
                 source_page_index=page_number - 1,
+                translated=page_number in requested,
             )
+
+
+def _untranslated_part(config: Any, collector: CompactIRCollector, page_number: int):
+    import pymupdf
+    from babeldoc.format.pdf.translation_config import TranslateResult
+
+    output = Path(config.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    mono = output / "original.mono.pdf"
+    dual = output / "original.dual.pdf"
+    with pymupdf.open(config.input_file) as original:
+        if original.page_count != 1:
+            raise RuntimeError("跳过翻译仅支持逐页分片")
+        collector.capture_original_page(original[0], page_number=page_number)
+        original.save(mono)
+        with pymupdf.open() as paired:
+            paired.insert_pdf(original)
+            paired.insert_pdf(original)
+            paired.save(dual)
+    return TranslateResult(mono_pdf_path=mono, dual_pdf_path=dual)
 
 
 def _make_translator(job: dict[str, Any], base_url: str, api_key: str):
@@ -470,9 +508,7 @@ async def _translate(job_id: str) -> None:
         primary_font_family="serif",
         report_interval=0.25,
         metadata_extra_data="read-paper-babeldoc-lab",
-        split_strategy=PageCountStrategy(max_pages_per_part=1)
-        if not job.get("pages")
-        else None,
+        split_strategy=PageCountStrategy(max_pages_per_part=1),
     )
 
     def cancel_failed_translation() -> None:
@@ -494,9 +530,19 @@ async def _translate(job_id: str) -> None:
         engine=job["engine"],
     )
     high_level.init()
+    def publish_part(part_config: Any, page_number: int, result: Any) -> None:
+        mono = Path(result.no_watermark_mono_pdf_path or result.mono_pdf_path)
+        _publish_page(
+            job_id, page_number, mono, collector,
+            translated=page_number in job["requested_pages"],
+        )
+
     with (
         translator.client,
-        observe_babeldoc(config, collector, check_translation=guard.check),
+        observe_babeldoc(
+            config, collector, check_translation=guard.check,
+            untranslated_part=_untranslated_part, part_completed=publish_part,
+        ),
     ):
         async for event in high_level.async_translate(config):
             guard.check()
@@ -511,14 +557,6 @@ async def _translate(job_id: str) -> None:
                     progress=max(0.0, min(100.0, progress)),
                     stage=str(event.get("stage") or "处理中"),
                 )
-                if (
-                    event_type == "progress_end"
-                    and event.get("stage") == "Save PDF"
-                    and int(event.get("total_parts") or 1) > 1
-                ):
-                    page_number = int(event.get("part_index") or 0)
-                    if page_number > 0:
-                        _publish_part_page(job_id, config, collector, page_number)
             elif event_type == "error":
                 raise RuntimeError(
                     str(
@@ -535,8 +573,10 @@ async def _translate(job_id: str) -> None:
                     getattr(result, "no_watermark_mono_pdf_path", None)
                     or getattr(result, "mono_pdf_path", "")
                 )
-                if not job.get("pages"):
-                    _publish_missing_pages(job_id, mono_pdf, collector)
+                _publish_missing_pages(job_id, mono_pdf, collector)
+                with _jobs_lock:
+                    if _jobs[job_id]["translated_pages"] != job["requested_pages"]:
+                        raise RuntimeError("已完成翻译页与请求页码不一致")
                 ir_path = collector.write(output_dir / "compact-ir.v1.json")
                 files = _result_files(result, job_id, ir_path)
                 _write_manifest(job, files)
@@ -546,12 +586,9 @@ async def _translate(job_id: str) -> None:
                     progress=100.0,
                     stage="完成",
                     files=files,
-                    available_pages=list(range(1, int(job["total_pages"]) + 1))
-                    if not job.get("pages")
-                    else [],
-                    partial_revision=int(job["total_pages"])
-                    if not job.get("pages")
-                    else 0,
+                    available_pages=list(range(1, int(job["total_pages"]) + 1)),
+                    translated_pages=job["requested_pages"],
+                    partial_revision=int(job["total_pages"]),
                     metrics={
                         "seconds": round(
                             float(getattr(result, "total_seconds", 0) or 0), 2
@@ -641,7 +678,12 @@ def _create_job(
     if total_pages < 1:
         raise HTTPException(400, "PDF 没有可处理页面")
     digest = hashlib.sha256(raw).hexdigest()
-    normalized_pages = _normalize_pages(pages)
+    normalized_pages = _normalize_pages(pages, total_pages)
+    requested_pages = (
+        [page for part in normalized_pages.split(",")
+         for page in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)]
+        if normalized_pages else list(range(1, total_pages + 1))
+    )
     requested_signature = (
         digest,
         normalized_pages,
@@ -680,6 +722,8 @@ def _create_job(
             "progress": 0.0,
             "total_pages": total_pages,
             "available_pages": [],
+            "requested_pages": requested_pages,
+            "translated_pages": [],
             "partial_revision": 0,
             "error": None,
             "files": {"original": f"/api/jobs/{job_id}/files/original"},
@@ -750,6 +794,7 @@ def info() -> dict[str, Any]:
         "auth_required": bool(WORKER_TOKEN),
         "split_parts_supported": True,
         "incremental_pages": True,
+        "page_selection_supported": True,
         "worker_api_version": 2,
         "sample_available": Path(os.getenv("BABELDOC_SAMPLE_PDF", "")).is_file(),
         "table_notice": TABLE_NOTICE,

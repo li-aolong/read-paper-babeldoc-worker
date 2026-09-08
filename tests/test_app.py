@@ -52,6 +52,7 @@ def test_info_exposes_pinned_engine_without_secrets() -> None:
     assert body["engine"]["version"] == app.BABELDOC_VERSION
     assert body["engine"]["revision"] == app.BABELDOC_REVISION
     assert body["engine_valid"] is True
+    assert body["page_selection_supported"] is True
     assert "api_key" not in body
     assert "token" not in json.dumps(body).lower()
     assert "文本型 PDF 表格" in body["table_notice"]
@@ -215,7 +216,7 @@ def test_idempotent_concurrent_submit_creates_one_job(
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     monkeypatch.setattr(app, "_executor", executor)
     key = "a" * 32
-    raw = pdf_bytes("concurrent")
+    raw = pdf_bytes("concurrent", pages=6)
 
     def submit(qps: int) -> dict:
         return app._create_job(
@@ -267,7 +268,7 @@ def test_idempotency_conflict_and_failed_retry(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(app, "_idempotency_jobs", {})
     monkeypatch.setattr(app, "_executor", executor)
     key = "c" * 32
-    first_pdf = pdf_bytes("first")
+    first_pdf = pdf_bytes("first", pages=2)
     second_pdf = pdf_bytes("second")
     first = app._create_job(first_pdf, "paper.pdf", "1", 2, True, False, key)
 
