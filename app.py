@@ -341,18 +341,20 @@ def _publish_page(
     page_dir = _page_dir(job_id, page_number)
     page_dir.mkdir(parents=True, exist_ok=True)
     destination = page_dir / "mono.pdf"
+    if destination.exists():
+        raise FileExistsError(f"已发布的第 {page_number} 页 PDF 不可覆盖")
     temporary = destination.with_name(f".mono.{secrets.token_hex(8)}.writing.pdf")
     with pymupdf.open(source_pdf) as document:
         if source_page_index < 0 or source_page_index >= document.page_count:
             raise RuntimeError(f"第 {page_number} 页增量产物页码无效")
-        source_page = document[source_page_index]
-        pixmap = source_page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
         with pymupdf.open() as preview:
-            page = preview.new_page(
-                width=source_page.rect.width, height=source_page.rect.height
+            # Copy the complete PDF resource graph, including embedded fonts and
+            # vector content. Do not rasterize or re-subset BabelDOC's fonts:
+            # this file must stay readable after part working files are cleaned.
+            preview.insert_pdf(
+                document, from_page=source_page_index, to_page=source_page_index
             )
-            page.insert_image(page.rect, stream=pixmap.tobytes("png"))
-            preview.save(temporary, garbage=4, deflate=True)
+            preview.save(temporary, garbage=4, deflate=True, deflate_fonts=True)
     temporary.replace(destination)
     collector.write(page_dir / "ir.json", page_numbers={page_number})
     with _jobs_lock:

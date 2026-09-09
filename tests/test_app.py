@@ -503,7 +503,7 @@ def test_compact_ir_collector_merges_split_parts_and_writes_one_page(
     assert [page["page_number"] for page in partial["pages"]] == [2]
 
 
-def test_publish_page_creates_small_raster_pdf_and_updates_status(
+def test_publish_page_preserves_vector_text_and_updates_status(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(app, "DATA_ROOT", tmp_path)
@@ -541,6 +541,9 @@ def test_publish_page_creates_small_raster_pdf_and_updates_status(
     output = tmp_path / "job-1" / "pages" / "0001" / "mono.pdf"
     with pymupdf.open(output) as preview:
         assert preview.page_count == 1
+        assert "incremental 2" in preview[0].get_text()
+        assert preview[0].get_fonts()
+        assert preview[0].get_images() == []
     assert output.stat().st_size < 1_000_000
     assert app._jobs["job-1"]["available_pages"] == [1]
     assert app._jobs["job-1"]["partial_revision"] == 1
