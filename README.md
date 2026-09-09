@@ -4,6 +4,12 @@
 
 ## 当前边界
 
+### 后台服务的网络配置
+
+systemd 服务不会自动继承交互式终端的代理设置。若命令行调用海外接口成功而后台请求超时，应核对服务进程的 `https_proxy` / `http_proxy`，并用 `NO_PROXY` 保持本机回环及国内模型端点直连。生产 WSL 通过服务 drop-in 的 `EnvironmentFile=%h/.config/read-paper/worker-network.env` 显式读取现有网络配置；不要把代理凭据写入 Git。修改后执行用户级 daemon-reload，并仅在没有用户任务运行时重启 worker。
+
+逐页产物保留文本与矢量资源，并使用字体子集化减小传输体积。Gemini 的 OpenAI 兼容接口使用 `reasoning_effort=low`，避免全文翻译采用默认的高推理预算。
+
 - BabelDOC 固定到 `38d3896dcde9b5a940c62cf5563cadea673a64d3`（包版本 0.6.4）。
 - 服务启动时会从已安装包的 `direct_url.json` 核验版本、requested revision 和实际 commit。校验失败时任务会失败，不会返回缺失 IR 的完成状态。
 - 使用 OpenAI-compatible 翻译接口；默认按本机已有 `GLM_API_KEY` 配置运行 GLM-4 Flash。
