@@ -42,7 +42,12 @@ def test_published_page_is_independent_with_embedded_fonts_and_exact_zoom(
         page = document[0]
         assert page.get_text() == text
         assert "清晰中文" in text
-        assert [document.extract_font(font[0])[3] for font in page.get_fonts()] == fonts
+        published_fonts = [document.extract_font(font[0])[3] for font in page.get_fonts()]
+        assert len(published_fonts) == len(fonts)
+        assert all(published_fonts)
+        if not subset:
+            assert sum(map(len, published_fonts)) < sum(map(len, fonts)) / 5
+        assert (tmp_path / "job/pages/0001/mono.pdf").stat().st_size < 100_000
         assert page.get_images() == []
         assert len(page.get_drawings()) == 2
         assert (page.mediabox, page.cropbox, page.rotation) == geometry

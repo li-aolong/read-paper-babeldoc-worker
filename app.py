@@ -348,12 +348,13 @@ def _publish_page(
         if source_page_index < 0 or source_page_index >= document.page_count:
             raise RuntimeError(f"第 {page_number} 页增量产物页码无效")
         with pymupdf.open() as preview:
-            # Copy the complete PDF resource graph, including embedded fonts and
-            # vector content. Do not rasterize or re-subset BabelDOC's fonts:
-            # this file must stay readable after part working files are cleaned.
+            # Copy the resource graph, then retain only glyphs used on this page.
+            # BabelDOC skips font subsetting for split parts; copying full CJK
+            # fonts otherwise makes each incremental page tens of megabytes.
             preview.insert_pdf(
                 document, from_page=source_page_index, to_page=source_page_index
             )
+            preview.subset_fonts()
             preview.save(temporary, garbage=4, deflate=True, deflate_fonts=True)
     temporary.replace(destination)
     collector.write(page_dir / "ir.json", page_numbers={page_number})
