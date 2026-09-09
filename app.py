@@ -438,6 +438,11 @@ def _make_translator(job: dict[str, Any], base_url: str, api_key: str):
         enable_json_mode_if_requested=False,
         send_temperature=True,
     )
+    if base_url.rstrip("/") == "https://generativelanguage.googleapis.com/v1beta/openai":
+        # Translation needs bounded reasoning, not the provider's default
+        # high-budget thinking. Gemini's OpenAI endpoint uses this exact field.
+        translator.extra_body["reasoning_effort"] = "low"
+        translator.add_cache_impact_parameters("gemini_reasoning_effort", "low")
     # BabelDOC's built-in cache only keys the model, not its API provider.
     # Keep every job isolated, with no credential material in cache parameters.
     translator.add_cache_impact_parameters(

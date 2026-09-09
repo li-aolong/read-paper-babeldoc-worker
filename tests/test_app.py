@@ -77,6 +77,17 @@ def test_home_page_is_available() -> None:
     assert "适应宽度" in response.text
 
 
+def test_google_translator_uses_bounded_reasoning():
+    translator = app._make_translator(
+        {"id": "reasoning-test", "lang_in": "en", "lang_out": "zh", "model": "gemini-3.5-flash", "provider_fingerprint": "test"},
+        "https://generativelanguage.googleapis.com/v1beta/openai", "test-key",
+    )
+    try:
+        assert translator.extra_body["reasoning_effort"] == "low"
+    finally:
+        translator.client.close()
+
+
 def test_pdf_preview_is_inline_and_download_is_attachment(
     tmp_path: Path, monkeypatch
 ) -> None:
