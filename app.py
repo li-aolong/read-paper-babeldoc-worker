@@ -209,6 +209,7 @@ def _idempotency_signature(job: dict[str, Any]) -> tuple[Any, ...]:
         bool(job.get("auto_extract_glossary")),
         job.get("model"),
         job.get("provider_fingerprint"),
+        bool(job.get("force_retranslate")),
     )
 
 
@@ -434,7 +435,7 @@ def _make_translator(job: dict[str, Any], base_url: str, api_key: str):
         model=job["model"],
         base_url=base_url,
         api_key=api_key,
-        ignore_cache=False,
+        ignore_cache=bool(job.get("force_retranslate")),
         enable_json_mode_if_requested=False,
         send_temperature=True,
     )
@@ -655,6 +656,7 @@ def _create_job(
     idempotency_key: str | None = None,
     model: str | None = None,
     credentials: dict[str, str] | None = None,
+    force_retranslate: bool = False,
 ) -> dict[str, Any]:
     selected_model = model.strip() if model is not None else _default_model()
     source = "user" if credentials else "worker"
@@ -699,6 +701,7 @@ def _create_job(
         bool(auto_extract_glossary),
         selected_model,
         fingerprint,
+        bool(force_retranslate),
     )
 
     with _jobs_lock:
@@ -739,6 +742,7 @@ def _create_job(
             "qps": max(1, min(4, int(qps))),
             "skip_scanned_detection": bool(skip_scanned_detection),
             "auto_extract_glossary": bool(auto_extract_glossary),
+            "force_retranslate": force_retranslate,
             "babeldoc_version": ENGINE["version"],
             "babeldoc_revision": ENGINE["revision"],
             "lang_in": "en",
@@ -802,6 +806,7 @@ def info() -> dict[str, Any]:
         "auth_required": bool(WORKER_TOKEN),
         "split_parts_supported": True,
         "incremental_pages": True,
+        "regeneration_supported": True,
         "page_selection_supported": True,
         "worker_api_version": 2,
         "sample_available": Path(os.getenv("BABELDOC_SAMPLE_PDF", "")).is_file(),
@@ -837,6 +842,7 @@ async def create_job(
     api_base_url: Annotated[str | None, Form()] = None,
     api_key: Annotated[str | None, Form()] = None,
     provider: Annotated[str | None, Form()] = None,
+    force_retranslate: Annotated[bool, Form()] = False,
 ) -> dict[str, Any]:
     credentials = None
     if api_base_url is not None or api_key is not None or provider is not None:
@@ -870,6 +876,7 @@ async def create_job(
         idempotency_key,
         model,
         credentials,
+        force_retranslate,
     )
 
 
