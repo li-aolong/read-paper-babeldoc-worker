@@ -88,6 +88,14 @@ def test_google_translator_uses_bounded_reasoning():
         translator.client.close()
 
 
+def test_explicit_regeneration_bypasses_translation_cache():
+    translator=app._make_translator({"id":"fresh","lang_in":"en","lang_out":"zh","model":"test","provider_fingerprint":"test","force_retranslate":True},"https://api.example/v1","test-key")
+    try:
+        assert translator.ignore_cache is True
+    finally:
+        translator.client.close()
+
+
 def test_pdf_preview_is_inline_and_download_is_attachment(
     tmp_path: Path, monkeypatch
 ) -> None:
